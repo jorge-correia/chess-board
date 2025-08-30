@@ -18,14 +18,13 @@ static struct pci_dev *chess_pcidev;
 static void __iomem *mmio;
 
 void *virt_buffer;
-dma_addr_t phys_buffer; // is it bus addresses already (IOVA or something?)
-
-
-
 
 /*
-* TODO do I need to add a handle to MSI?
+in real world, this address would be the a bus address (IOVA translated by IOMMU
+or an address that will suffer an offset from host bridge. In qemu, this address
+is the same as host address
 */
+dma_addr_t phys_buffer; 
 
 static struct pci_device_id pci_ids[] = {
 	//creating a struct pci_device_id matching the vendor id and device id.
@@ -41,20 +40,19 @@ static long chess_ioctl (struct file *file, unsigned int cmd, unsigned long arg)
 
         //uint32_t __user *usr = (int*) arg;
         //uint32_t reg_value;
-        printk ("[CHESS-driver] entering ioctl\n");
         switch (cmd) {
                 case CHESS_IOCTL_READ_REG:
-                        printk ("[CHESS-driver] starting DMA (host -> dev), src %llx, dst %llx\n", (uint64_t)phys_buffer, (uint64_t)0);
-                        printk ("src low: %llx\n", ((uint64_t)phys_buffer) & 0xffffffff );
-                        printk ("src high: %llx\n", (((uint64_t)phys_buffer) >> 32) & 0xffffffff );
-                        memset (virt_buffer, 'b', 0x1000);
-
+                        printk ("[CHESS-driver] starting DMA (host -> dev)\n");
+                        
+                        memset (virt_buffer, 'c', 0x1000);
 
                         // setting addresses
                         // src low
-                        iowrite32 (((uint64_t)phys_buffer) & 0xffffffff ,((uint8_t*)mmio) + 0x4);
+                        iowrite32 (((uint64_t)phys_buffer) & 0xffffffff,
+                                        ((uint8_t*)mmio) + 0x4);
                         // src high
-                        iowrite32 ((((uint64_t)phys_buffer) >> 32) & 0xffffffff ,((uint8_t*)mmio) + 0x8);
+                        iowrite32 ((((uint64_t)phys_buffer) >> 32) &
+                                        0xffffffff, ((uint8_t*)mmio) + 0x8);
                         // dst low
                         iowrite32 (0 ,((uint8_t*)mmio) + 0xc);
                         // dst high
@@ -64,16 +62,6 @@ static long chess_ioctl (struct file *file, unsigned int cmd, unsigned long arg)
 
                         // setting command to READ
                         iowrite32 (1, (void*)mmio);
-                        /*
-                        printk ("[CHESS-driver] ioctl read\n");
-                        reg_value = ioread32 ((void*)(mmio));
-                        if (copy_to_user (usr, &reg_value, 4)){
-                                printk ("[CHESS-driver] copy_to_user error\n");
-                                return -EFAULT;
-                        }
-                        printk ("[CHESS-driver] reading reg: %d\n", reg_value);
-                        */
-                        printk ("end issuing READ, fb %c\n", *(uint8_t*)virt_buffer);
                 break;
 
                 case CHESS_IOCTL_WRITE_REG:
@@ -87,28 +75,16 @@ static long chess_ioctl (struct file *file, unsigned int cmd, unsigned long arg)
                         // src high
                         iowrite32 (0 ,((uint8_t*)mmio) + 0x8);
                         // dst low
-                        iowrite32 (((uint64_t)phys_buffer) & 0xffffffff ,((uint8_t*)mmio) + 0xc);
+                        iowrite32 (((uint64_t)phys_buffer) & 0xffffffff,
+                                        ((uint8_t*)mmio) + 0xc);
                         // dst high
-                        iowrite32 ((((uint64_t)phys_buffer) >> 32) & 0xffffffff ,((uint8_t*)mmio) + 0x10);
+                        iowrite32 ((((uint64_t)phys_buffer) >> 32) &
+                                        0xffffffff, ((uint8_t*)mmio) + 0x10);
                         // size
                         iowrite32 (0x1000,((uint8_t*)mmio) + 0x14);
 
                         // setting command to WRITE
                         iowrite32 (2, (void*)mmio);
-
-                        
-
-                        /*
-                        printk ("[CHESS-driver] ioctl write\n");
-                        if (copy_from_user (&reg_value, usr, 4)) {
-                                printk ("[CHESS-driver] copy_from_user error\n");
-                                return -EFAULT;
-
-                        }
-                        iowrite32(reg_value, mmio);
-
-                        printk ("[CHESS-driver] writing reg: %d\n", reg_value);
-                        */
                 break;
 
                 default:
@@ -139,11 +115,13 @@ static irqreturn_t chess_irq_handler (int irq, void *dev)
         printk ("[CHESS-driver] IRQ received on device %d\n", *(int*)dev);
         uint32_t interrupt_status = ioread32 (((uint8_t*)(mmio )) + 0x18);
         printk ("[CHESS-driver] IRQ cause %d\n", interrupt_status);
+        
         printk ("[CHESS-driver] dma bytes:\n");
         
         if (interrupt_status == 2)
                 for (int i = 0 ; i < 0x10; i++)
                         printk ("%c\n", *(uint8_t*)(((uint8_t*)virt_buffer) + i));
+       
        
 
         return IRQ_HANDLED;
@@ -247,18 +225,21 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
         {
                 // fallback to INTx
                 printk ("[CHESS-driver] registering INTx handler\n");
-                if (request_irq (pci_irq_vector(dev, 0), chess_irq_handler, IRQF_SHARED,
-                                        "chess-board", &first_dev) < 0){
-                        printk ("[CHESS-driver] error on registering IRQ handler\n");
+                if (request_irq (pci_irq_vector(dev, 0), chess_irq_handler,
+                                        IRQF_SHARED, "chess-board",
+                                        &first_dev) < 0){
+                        printk ("[CHESS-driver] error registering IRQ handler\n");
                         goto error;
                 }
         }
         else {
 
-                printk ("[CHESS-driver] registering MSI handler %d\n", pci_irq_vector (dev, 0));
+                printk ("[CHESS-driver] registering MSI handler %d\n",
+                                pci_irq_vector (dev, 0));
+
                 if (request_irq(pci_irq_vector(dev, 0), chess_msi_handler, 0,
                                         "chess-board", &first_dev)) {
-                        printk ("[CHESS-driver] error on registering MSI handler\n");
+                        printk ("[CHESS-driver] error registering MSI handler\n");
                         goto error;
                 }
         }
@@ -269,10 +250,6 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
         virt_buffer = dma_alloc_coherent (&dev->dev, 0x1000, &phys_buffer,
                         GFP_KERNEL);
         printk ("[CHESS-driver] done allocating DMA kernel region\n");
-
-
-
-        // ----
 
 
         // adding handler for interrupt line
@@ -291,7 +268,9 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
         printk ("[CHESS-driver] BAR start: %llx | BAR end: %llx | size: %llx\n",
                         (uint64_t) start, (uint64_t) end,
                         (uint64_t) (end + 1 - start));
-        printk ("[CHESS-driver] sizeof(resource_size_t): %lx\n", sizeof(resource_size_t));
+
+        printk ("[CHESS-driver] sizeof(resource_size_t): %lx\n",
+                        sizeof(resource_size_t));
         
         
         printk ("[CHESS-driver] initial reg value: %x\n",

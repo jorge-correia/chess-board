@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #define CHESS_MAGIC 'c'
 #define CHESS_IOCTL_READ_REG _IOR (CHESS_MAGIC, 0, int*)
@@ -18,6 +19,8 @@ int main ()
                 printf ("ioctl returned error %d\n", ret);
                 exit (1);
         }
+
+        sleep (2);
         
 
         if (ret = ioctl (chess_fd, CHESS_IOCTL_READ_REG, &reg))
@@ -30,6 +33,7 @@ int main ()
 
        
 
+        sleep (2);
 
 
 
