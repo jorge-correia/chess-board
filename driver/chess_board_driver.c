@@ -21,8 +21,9 @@ void *virt_buffer;
 
 /*
 in real world, this address would be the a bus address (IOVA translated by IOMMU
-or an address that will suffer an offset from host bridge. In qemu, this address
-is the same as host address
+or an address that will suffer an offset from host bridge. In qemu the current
+qemu config, this address is the same as host address. I need to understand the
+scenario where IOVA is enabled
 */
 dma_addr_t phys_buffer; 
 
@@ -44,7 +45,7 @@ static long chess_ioctl (struct file *file, unsigned int cmd, unsigned long arg)
                 case CHESS_IOCTL_READ_REG:
                         printk ("[CHESS-driver] starting DMA (host -> dev)\n");
                         
-                        memset (virt_buffer, 'c', 0x1000);
+                        //memset (virt_buffer, 'c', 0x1000);
 
                         // setting addresses
                         // src low
@@ -95,10 +96,33 @@ static long chess_ioctl (struct file *file, unsigned int cmd, unsigned long arg)
         return 0;
 }
 
+static unsigned int chess_mmap_fault_handler (struct vm_fault *vmf)
+{
+        printk ("[CHESS-driver] starting mmap fault %llx\n", vmf->pgoff);
+        struct page *page = virt_to_page (virt_buffer +
+                        (vmf->pgoff * PAGE_SIZE));
+
+        get_page (page);
+        vmf->page = page;
+
+        return 0;
+}
+
+struct vm_operations_struct chess_vm_ops = {
+        .fault = chess_mmap_fault_handler,
+};
+
+static int chess_mmap (struct file *filp, struct vm_area_struct *vma)
+{
+        vma->vm_ops = &chess_vm_ops;
+        return 0;
+}
+
 
 static struct file_operations chrdev_fops = {
         .owner = THIS_MODULE,
         .unlocked_ioctl = chess_ioctl,
+        .mmap = chess_mmap,
 };
 
 /*
@@ -132,9 +156,14 @@ static irqreturn_t chess_irq_handler (int irq, void *dev)
 static irqreturn_t chess_msi_handler (int irq, void *dev)
 {
         printk ("[CHESS-driver] MSI received on device %d\n", *(int*)dev);
-        uint32_t interrupt_status = ioread32 (((uint8_t*)(mmio )) + 4);
+        uint32_t interrupt_status = ioread32 (((uint8_t*)(mmio )) + 0x18);
         printk ("[CHESS-driver] MSI cause %d\n", interrupt_status);
 
+        printk ("[CHESS-driver] dma bytes:\n");
+        
+        if (interrupt_status == 2)
+                for (int i = 0 ; i < 0x10; i++)
+                        printk ("%c\n", *(uint8_t*)(((uint8_t*)virt_buffer) + i));
         return IRQ_HANDLED;
 
         
@@ -209,15 +238,40 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
                 goto error;
         }
 
-        /* getting a virtual memory address that points to the physical memory
+        // sanity checking BAR type
+        if ((pci_resource_flags(dev, CHESS_BAR) & IORESOURCE_MEM) !=
+                        IORESOURCE_MEM) {
+
+                printk ("[CHESS-driver] Unexpected BAR type\n");
+                goto error;
+        }
+
+        /* getting a virtual memory address that points to the "physical memory"
         present in BAR
         */
         mmio = pci_iomap (dev, CHESS_BAR, pci_resource_len (dev, CHESS_BAR));
 
-        // adding handler for interrupt line
 
-        // the return of pci_alloc_irq_vectors is positive if the PCI device
-        // is MSI-capable (executed msi_init on realize)
+        // printing some infos
+        resource_size_t start = pci_resource_start (dev, CHESS_BAR);
+        resource_size_t end = pci_resource_end (dev, CHESS_BAR);
+        printk ("[CHESS-driver] BAR start: %llx | BAR end: %llx | size: %llx\n",
+                        (uint64_t) start, (uint64_t) end,
+                        (uint64_t) (end + 1 - start));
+
+        printk ("[CHESS-driver] sizeof(resource_size_t): %lx\n",
+                        sizeof(resource_size_t));
+        
+        
+        printk ("[CHESS-driver] initial reg value: %x\n",
+                        ioread32 ((void*)mmio));
+
+        /*
+           adding handler for interrupt line
+
+           the return of pci_alloc_irq_vectors is positive if the PCI device
+           is MSI-capable (executed msi_init on realize)
+         */
         int num_vectors = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI);
         printk ("[CHESS-driver] num_vectors: %d\n", num_vectors);
 
@@ -249,34 +303,32 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
         // allocating region for DMA
         virt_buffer = dma_alloc_coherent (&dev->dev, 0x1000, &phys_buffer,
                         GFP_KERNEL);
-        printk ("[CHESS-driver] done allocating DMA kernel region\n");
 
 
-        // adding handler for interrupt line
+        /*
+           configuring MSI interrupt to generate NMI. The steps are:
+           1. find MSI capability struct
+           2. Message data field is composed of 4 fields. We need to set the 
+           field "delivery mode" (10:8) to NMI and "trigger mode"(12) to zero 
+           (indicating edge trigger mode)
 
-        // sanity checking BAR type
-        if ((pci_resource_flags(dev, CHESS_BAR) & IORESOURCE_MEM) !=
-                        IORESOURCE_MEM) {
+           The PCI device creates the MSI message based on this message data
+           field
+         */
 
-                printk ("[CHESS-driver] Unexpected BAR type\n");
-                goto error;
-        }
+        /*
+        uint16_t msi_cap_offset = pci_find_capability (dev, PCI_CAP_ID_MSI);
+        uint16_t msg_data;
+        pci_read_config_word (dev, msi_cap_offset + PCI_MSI_DATA_64, &msg_data);
+       
+        msg_data &= ~0x0700;
+        msg_data |= 0x0400;
+        msg_data &= ~(1 << 12);
+        printk ("writing capability value %x\n", msg_data);
+        pci_write_config_word (dev, msi_cap_offset + PCI_MSI_DATA_64, msg_data);
+        */
 
-        // printing some infos
-        resource_size_t start = pci_resource_start (dev, CHESS_BAR);
-        resource_size_t end = pci_resource_end (dev, CHESS_BAR);
-        printk ("[CHESS-driver] BAR start: %llx | BAR end: %llx | size: %llx\n",
-                        (uint64_t) start, (uint64_t) end,
-                        (uint64_t) (end + 1 - start));
-
-        printk ("[CHESS-driver] sizeof(resource_size_t): %lx\n",
-                        sizeof(resource_size_t));
         
-        
-        printk ("[CHESS-driver] initial reg value: %x\n",
-                        ioread32 ((void*)mmio));
-
-
         printk ("[CHESS-driver] chess_probe() ended successfully\n");
         return 0;
 error:
