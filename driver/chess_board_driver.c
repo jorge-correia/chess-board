@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <asm/nmi.h>
 #include "chess_board_driver.h"
 
 static dev_t first_dev;
@@ -153,11 +154,33 @@ static irqreturn_t chess_irq_handler (int irq, void *dev)
         
 }
 
+static int chess_nmi_handler(unsigned int val, struct pt_regs* regs)
+{
+    pr_info("[CHESS-driver] NMI HANDLED: 0x%x\n", val);
+    return NMI_HANDLED;
+}
+
 static irqreturn_t chess_msi_handler (int irq, void *dev)
 {
         printk ("[CHESS-driver] MSI received on device %d\n", *(int*)dev);
         uint32_t interrupt_status = ioread32 (((uint8_t*)(mmio )) + 0x18);
         printk ("[CHESS-driver] MSI cause %d\n", interrupt_status);
+
+        printk ("[CHESS-driver] dma bytes:\n");
+        
+        if (interrupt_status == 2)
+                for (int i = 0 ; i < 0x10; i++)
+                        printk ("%c\n", *(uint8_t*)(((uint8_t*)virt_buffer) + i));
+        return IRQ_HANDLED;
+
+        
+}
+
+static irqreturn_t chess_msix_handler (int irq, void *dev)
+{
+        printk ("[CHESS-driver] MSI-X received on device %d\n", *(int*)dev);
+        uint32_t interrupt_status = ioread32 (((uint8_t*)(mmio )) + 0x18);
+        printk ("[CHESS-driver] MSI-X cause %d\n", interrupt_status);
 
         printk ("[CHESS-driver] dma bytes:\n");
         
@@ -238,6 +261,11 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
                 goto error;
         }
 
+        if (pci_request_region (dev, 1, "chess-bar1")) {
+                printk ("[CHESS-driver] error on requesting BAR access\n");
+                goto error;
+        }
+
         // sanity checking BAR type
         if ((pci_resource_flags(dev, CHESS_BAR) & IORESOURCE_MEM) !=
                         IORESOURCE_MEM) {
@@ -268,36 +296,58 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
 
         /*
            adding handler for interrupt line
-
-           the return of pci_alloc_irq_vectors is positive if the PCI device
-           is MSI-capable (executed msi_init on realize)
          */
-        int num_vectors = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI);
-        printk ("[CHESS-driver] num_vectors: %d\n", num_vectors);
-
-        if (num_vectors < 0)
-        {
-                // fallback to INTx
-                printk ("[CHESS-driver] registering INTx handler\n");
-                if (request_irq (pci_irq_vector(dev, 0), chess_irq_handler,
-                                        IRQF_SHARED, "chess-board",
-                                        &first_dev) < 0){
-                        printk ("[CHESS-driver] error registering IRQ handler\n");
+        int num_vectors;
+        if (pci_find_capability (dev, PCI_CAP_ID_MSIX)){
+                num_vectors = pci_alloc_irq_vectors (dev, 2, 2, PCI_IRQ_MSIX);
+                if (num_vectors != 2){
+                        printk ("[CHESS-driver] error allocing irq vectors\n");
                         goto error;
                 }
-        }
-        else {
+                printk ("[CHESS-driver] registering %d MSI-X handlers %d, %d\n",
+                                num_vectors, pci_irq_vector (dev, 0),
+                                pci_irq_vector (dev, 1));
 
-                printk ("[CHESS-driver] registering MSI handler %d\n",
-                                pci_irq_vector (dev, 0));
-
-                if (request_irq(pci_irq_vector(dev, 0), chess_msi_handler, 0,
+                if (request_irq(pci_irq_vector(dev, 0), chess_msix_handler, 0,
+                                        "chess-board", &first_dev)) {
+                        printk ("[CHESS-driver] error registering MSI handler\n");
+                        goto error;
+                }
+                
+                if (request_irq(pci_irq_vector(dev, 1), chess_msix_handler, 0,
                                         "chess-board", &first_dev)) {
                         printk ("[CHESS-driver] error registering MSI handler\n");
                         goto error;
                 }
         }
-        printk ("[CHESS-driver] done with INTx/MSI handler\n");
+        else{
+                num_vectors = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI);
+                printk ("[CHESS-driver] num_vectors: %d\n", num_vectors);
+
+                if (num_vectors < 0)
+                {
+                        // fallback to INTx
+                        printk ("[CHESS-driver] registering INTx handler\n");
+                        if (request_irq (pci_irq_vector(dev, 0), chess_irq_handler,
+                                                IRQF_SHARED, "chess-board",
+                                                &first_dev) < 0){
+                                printk ("[CHESS-driver] error registering IRQ handler\n");
+                                goto error;
+                        }
+                }
+                else {
+
+                        printk ("[CHESS-driver] registering MSI handler %d\n",
+                                        pci_irq_vector (dev, 0));
+
+                        if (request_irq(pci_irq_vector(dev, 0), chess_msi_handler, 0,
+                                                "chess-board", &first_dev)) {
+                                printk ("[CHESS-driver] error registering MSI handler\n");
+                                goto error;
+                        }
+                }
+        }
+        printk ("[CHESS-driver] done with INTx/MSI/MSI-X handler\n");
 
 
         // allocating region for DMA
@@ -316,17 +366,54 @@ static int chess_probe (struct pci_dev *dev, const struct pci_device_id *id)
            field
          */
 
-        /*
-        uint16_t msi_cap_offset = pci_find_capability (dev, PCI_CAP_ID_MSI);
+        
+       
+       /*
+       uint16_t msi_cap_offset = pci_find_capability (dev, PCI_CAP_ID_MSI);
         uint16_t msg_data;
         pci_read_config_word (dev, msi_cap_offset + PCI_MSI_DATA_64, &msg_data);
+        */
        
-        msg_data &= ~0x0700;
+        
+      /*  msg_data &= ~0x0700;
         msg_data |= 0x0400;
         msg_data &= ~(1 << 12);
         printk ("writing capability value %x\n", msg_data);
         pci_write_config_word (dev, msi_cap_offset + PCI_MSI_DATA_64, msg_data);
-        */
+       */
+
+
+        static void __iomem *mmio_msix_table;
+        uint32_t table_entry;
+        mmio_msix_table = pci_iomap (dev, 1, pci_resource_len (dev, 1));
+
+        for (int i = 0 ; i < 12 ; i+=4){
+                table_entry = ioread32 (((uint8_t*)(mmio_msix_table)) + i);
+                printk ("mmio_msix_table + %d: %lx\n", i, table_entry);
+        }
+        
+        
+        printk ("mmio_msix_table: %llx\n", (uint64_t)mmio_msix_table);
+        table_entry &= ~0x0700;
+        table_entry |= 0x0400;
+        table_entry &= ~(1<<12);
+        iowrite32 (table_entry, ((uint8_t*)mmio_msix_table) + 0x8);
+        
+       
+        for (int i = 0 ; i < 12 ; i+=4){
+                table_entry = ioread32 (((uint8_t*)(mmio_msix_table)) + i);
+                printk ("mmio_msix_table + %d: %lx\n", i, table_entry);
+        }
+        
+
+        
+        
+        register_nmi_handler (NMI_UNKNOWN, chess_nmi_handler, 0,
+                        "chess-driver-custom-handler");
+        
+       
+        
+       
 
         
         printk ("[CHESS-driver] chess_probe() ended successfully\n");

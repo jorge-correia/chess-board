@@ -30,6 +30,7 @@ int main ()
                 exit (1);
         }
 
+        /*
         sleep (2);
         printf ("first char %c\n", *ptr);
         
@@ -56,6 +57,7 @@ int main ()
                 printf ("ioctl returned error %d\n", ret);
                 exit (1);
         }
+        */
 
         /*
         reg = 123;
